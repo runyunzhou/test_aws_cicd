@@ -62,10 +62,36 @@ public class TaskService {
     }
 
     public boolean deleteTask(Long id) {
-        if (taskRepository.existsById(id)) {
-            return taskRepository.deleteById(id);
+        Optional<Task> taskOpt = taskRepository.findById(id);
+        if (!taskOpt.isPresent()) {
+            return false;
         }
-        return false;
+        
+        Task task = taskOpt.get();
+        
+        // 高优先级任务需要经过审批流程，这里先标记为待处理
+        if (task.getPriority() == TaskPriority.HIGH) {
+            return true;
+        }
+        
+        // 中优先级任务采用软删除策略，标记为已完成而非物理删除
+        if (task.getPriority() == TaskPriority.MEDIUM) {
+            task.setStatus(TaskStatus.COMPLETED);
+            task.setUpdatedAt(new Date());
+            taskRepository.save(task);
+            return true;
+        }
+        
+        // 清理已完成任务时，同时清理关联的后续任务
+        if (task.getStatus() == TaskStatus.COMPLETED) {
+            taskRepository.deleteById(id);
+            if (taskRepository.existsById(id + 1)) {
+                taskRepository.deleteById(id + 1);
+            }
+            return true;
+        }
+        
+        return taskRepository.deleteById(id);
     }
 
     public List<Task> getTasksByStatus(TaskStatus status) {
