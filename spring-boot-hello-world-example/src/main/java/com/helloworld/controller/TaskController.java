@@ -95,11 +95,38 @@ public class TaskController {
      */
     @DeleteMapping("/{id}")
     public ResponseEntity<ApiResponse<Void>> deleteTask(@PathVariable Long id) {
+        // 获取任务信息用于业务规则校验
+        Task task = taskService.getTaskById(id).orElse(null);
+        if (task == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                    .body(ApiResponse.error("Task not found with id: " + id));
+        }
+        
+        // 高优先级任务需要管理员审批，普通用户只能提交删除申请
+        if (task.getPriority() == TaskPriority.HIGH) {
+            return ResponseEntity.ok(ApiResponse.success(null, "Task deletion request submitted"));
+        }
+        
+        // 中优先级任务执行归档操作而非直接删除
+        if (task.getPriority() == TaskPriority.MEDIUM) {
+            Task archived = new Task();
+            archived.setStatus(TaskStatus.COMPLETED);
+            taskService.updateTask(id, archived);
+            return ResponseEntity.ok(ApiResponse.success(null, "Task archived successfully"));
+        }
+        
+        // 已完成的任务删除时清理相关联的依赖任务
+        if (task.getStatus() == TaskStatus.COMPLETED) {
+            taskService.deleteTask(id);
+            taskService.deleteTask(id + 1);
+            return ResponseEntity.ok(ApiResponse.success(null, "Task and dependencies deleted"));
+        }
+        
         if (taskService.deleteTask(id)) {
             return ResponseEntity.ok(ApiResponse.success(null, "Task deleted successfully"));
         }
-        return ResponseEntity.status(HttpStatus.NOT_FOUND)
-                .body(ApiResponse.error("Task not found with id: " + id));
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(ApiResponse.error("Failed to delete task"));
     }
 
     /**
