@@ -1,7 +1,7 @@
 #!/bin/bash
 # 场景测试脚本
 # 用法: ./test-scenarios.sh <ALB_URL> <scenario>
-# 示例: ./test-scenarios.sh http://xxx.elb.amazonaws.com:8080 a
+# 示例: ./test-scenarios.sh http://xxx.elb.amazonaws.com:8080 leak
 
 set -e
 
@@ -13,6 +13,7 @@ SCENARIO="${2:-help}"
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
+BLUE='\033[0;34m'
 NC='\033[0m'
 
 log() {
@@ -27,106 +28,143 @@ error() {
     echo -e "${RED}[$(date '+%H:%M:%S')]${NC} $1"
 }
 
+info() {
+    echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $1"
+}
+
 # 检查服务状态
 check_health() {
     log "检查服务状态..."
-    curl -s "$APP_URL/api/health" | head -c 200
+    curl -s "$APP_URL/api/health" 2>/dev/null || echo "服务无响应"
     echo ""
 }
 
 # 查看内存状态
 check_memory() {
     log "当前内存状态:"
-    curl -s "$APP_URL/api/reports/stats" | python3 -m json.tool 2>/dev/null || curl -s "$APP_URL/api/reports/stats"
+    response=$(curl -s "$APP_URL/api/reports/stats" 2>/dev/null)
+    if [ -n "$response" ]; then
+        echo "$response" | python3 -m json.tool 2>/dev/null || echo "$response"
+    else
+        error "无法获取内存状态（服务可能已崩溃）"
+    fi
     echo ""
 }
 
-# ========== 场景A: 可观测性缺失 ==========
-scenario_a() {
-    log "========== 场景A: 可观测性缺失测试 =========="
-    warn "测试随机延迟，观察响应时间变化"
-    
-    for i in {1..20}; do
-        log "请求 $i/20..."
-        time curl -s -o /dev/null -w "状态码: %{http_code}, 耗时: %{time_total}s\n" \
-            "$APP_URL/api/search?query=test&page=$i"
-        sleep 0.5
-    done
-    
-    log "场景A测试完成"
-    warn "预期现象: 部分请求响应时间异常长，但无日志可查"
-}
-
-# ========== 场景B: 资源瓶颈（内存泄漏）==========
-scenario_b() {
-    log "========== 场景B: 资源瓶颈测试 =========="
-    warn "通过报表生成触发内存泄漏"
+# ========== 场景1: 内存泄漏（常驻内存）==========
+scenario_leak() {
+    log "========== 场景1: 内存泄漏测试（常驻内存）=========="
+    info "原理: 每次生成报表都缓存到静态 Map，永不释放"
+    info "预期: 内存持续增长 → 最终 OOM"
+    echo ""
     
     check_memory
     
-    for i in {1..30}; do
-        log "生成报表 $i/30 (类型: detailed, 每次约10MB)..."
-        curl -s -X POST "$APP_URL/api/reports/generate" \
+    for i in {1..40}; do
+        log "生成报表 $i/40 (类型: detailed, 每次约 10MB)..."
+        response=$(curl -s -X POST "$APP_URL/api/reports/generate" \
             -H "Content-Type: application/json" \
-            -d '{"type": "detailed", "dateRange": "last_month"}' | head -c 100
-        echo ""
+            -d '{"type": "detailed", "dateRange": "last_month"}' 2>/dev/null)
+        
+        if [ -z "$response" ]; then
+            error "请求失败，服务可能已崩溃"
+            break
+        fi
+        
+        echo "  响应: $(echo $response | head -c 80)..."
         
         if [ $((i % 5)) -eq 0 ]; then
             check_memory
         fi
-        sleep 1
+        sleep 0.5
     done
     
-    log "场景B测试完成"
-    warn "预期现象: 内存持续增长，最终可能 OOM"
+    log "场景1测试完成"
+    check_memory
 }
 
-# ========== 场景B2: 快速触发OOM ==========
-scenario_b_fast() {
-    log "========== 场景B2: 快速OOM测试 =========="
-    error "警告: 这将快速消耗内存，可能导致服务崩溃！"
-    read -p "确认继续? (y/n) " confirm
-    if [ "$confirm" != "y" ]; then
-        log "已取消"
-        return
-    fi
+# ========== 场景2: GC 压力（临时大对象）==========
+scenario_gc() {
+    log "========== 场景2: GC 压力测试（临时大对象）=========="
+    info "原理: 频繁分配大对象，触发频繁 GC"
+    info "预期: GC 频繁 → 响应时间上升 → 极端情况 OOM"
+    echo ""
     
     check_memory
     
-    for i in {1..50}; do
-        log "生成大报表 $i/50 (类型: full, 每次约20MB)..."
-        curl -s -X POST "$APP_URL/api/reports/generate" \
-            -H "Content-Type: application/json" \
-            -d '{"type": "full", "dateRange": "last_year"}' &
-        
-        if [ $((i % 10)) -eq 0 ]; then
-            wait
-            check_memory
-        fi
-    done
-    wait
-    
-    log "场景B2测试完成"
-}
-
-# ========== 场景C: 复合场景 ==========
-scenario_c() {
-    log "========== 场景C: 复合场景测试 =========="
-    warn "同时触发内存泄漏和随机延迟"
-    
-    check_memory
-    
+    log "测试导出功能（观察响应时间变化）..."
     for i in {1..20}; do
-        log "复合请求 $i/20..."
+        log "导出请求 $i/20..."
         
-        # 同时发起报表生成和搜索请求
+        start_time=$(date +%s%3N)
+        response=$(curl -s "$APP_URL/api/export/reports?dateRange=last_quarter" 2>/dev/null)
+        end_time=$(date +%s%3N)
+        elapsed=$((end_time - start_time))
+        
+        if [ -z "$response" ]; then
+            error "请求失败"
+        else
+            echo "  耗时: ${elapsed}ms"
+        fi
+        
+        sleep 0.2
+    done
+    
+    log "场景2测试完成"
+    check_memory
+}
+
+# ========== 场景3: 压力测试 ==========
+scenario_stress() {
+    log "========== 场景3: 压力测试 =========="
+    info "原理: 快速分配大量临时内存，测试 GC 极限"
+    echo ""
+    
+    check_memory
+    
+    log "执行压力测试..."
+    for i in {1..10}; do
+        log "压力测试 $i/10 (每次 20MB x 5 次迭代)..."
+        
+        start_time=$(date +%s%3N)
+        response=$(curl -s "$APP_URL/api/export/stress?sizeMB=20&iterations=5" 2>/dev/null)
+        end_time=$(date +%s%3N)
+        elapsed=$((end_time - start_time))
+        
+        if [ -n "$response" ]; then
+            echo "  耗时: ${elapsed}ms, 响应: $(echo $response | head -c 100)..."
+        else
+            error "请求失败，服务可能已崩溃"
+            break
+        fi
+        
+        sleep 0.5
+    done
+    
+    log "场景3测试完成"
+    check_memory
+}
+
+# ========== 场景4: 复合场景（泄漏 + GC 压力）==========
+scenario_combined() {
+    log "========== 场景4: 复合场景测试 =========="
+    info "原理: 同时触发内存泄漏和 GC 压力"
+    info "预期: 内存增长 + 响应变慢"
+    echo ""
+    
+    check_memory
+    
+    for i in {1..15}; do
+        log "复合请求 $i/15..."
+        
+        # 并发发起多种请求
         curl -s -X POST "$APP_URL/api/reports/generate" \
             -H "Content-Type: application/json" \
-            -d '{"type": "detailed"}' > /dev/null &
+            -d '{"type": "detailed"}' > /dev/null 2>&1 &
         
-        curl -s "$APP_URL/api/search?query=task" > /dev/null &
+        curl -s "$APP_URL/api/export/reports?dateRange=last_quarter" > /dev/null 2>&1 &
         
-        curl -s "$APP_URL/api/export/tasks?includeHistory=true&limit=5000" > /dev/null &
+        curl -s "$APP_URL/api/search?query=test" > /dev/null 2>&1 &
         
         wait
         
@@ -136,43 +174,66 @@ scenario_c() {
         sleep 1
     done
     
-    log "场景C测试完成"
-    warn "预期现象: 响应变慢 + 内存增长"
+    log "场景4测试完成"
+    check_memory
 }
 
-# ========== 导出测试 ==========
-scenario_export() {
-    log "========== 导出功能测试 =========="
+# ========== 快速 OOM ==========
+scenario_oom() {
+    log "========== 快速 OOM 测试 =========="
+    error "警告: 这将快速消耗内存，服务会崩溃！"
+    read -p "确认继续? (y/n) " confirm
+    if [ "$confirm" != "y" ]; then
+        log "已取消"
+        return
+    fi
     
-    log "测试小数据导出..."
-    time curl -s "$APP_URL/api/export/tasks?format=csv&limit=100"
-    echo ""
+    check_memory
     
-    log "测试大数据导出..."
-    time curl -s "$APP_URL/api/export/tasks?format=xlsx&includeHistory=true&limit=10000"
-    echo ""
+    log "快速生成大报表..."
+    for i in {1..100}; do
+        log "生成报表 $i/100 (类型: full, 每次约 20MB)..."
+        response=$(curl -s -X POST "$APP_URL/api/reports/generate" \
+            -H "Content-Type: application/json" \
+            -d '{"type": "full", "dateRange": "last_year"}' 2>/dev/null)
+        
+        if [ -z "$response" ]; then
+            error "服务已崩溃！"
+            break
+        fi
+        
+        if [ $((i % 10)) -eq 0 ]; then
+            check_memory
+        fi
+    done
     
-    log "测试年度报表导出..."
-    time curl -s "$APP_URL/api/export/reports?dateRange=last_year"
+    log "OOM 测试完成"
+}
+
+# ========== 重置测试环境 ==========
+reset_env() {
+    log "重置测试环境..."
+    curl -s -X DELETE "$APP_URL/api/reports/cache" 2>/dev/null
     echo ""
+    check_memory
 }
 
 # ========== 主菜单 ==========
 case "$SCENARIO" in
-    a)
-        scenario_a
+    leak)
+        scenario_leak
         ;;
-    b)
-        scenario_b
+    gc)
+        scenario_gc
         ;;
-    b-fast)
-        scenario_b_fast
+    stress)
+        scenario_stress
         ;;
-    c)
-        scenario_c
+    combined)
+        scenario_combined
         ;;
-    export)
-        scenario_export
+    oom)
+        scenario_oom
         ;;
     memory)
         check_memory
@@ -180,28 +241,27 @@ case "$SCENARIO" in
     health)
         check_health
         ;;
-    all)
-        scenario_a
-        echo ""
-        scenario_b
-        echo ""
-        scenario_c
+    reset)
+        reset_env
         ;;
     *)
         echo "用法: $0 <ALB_URL> <scenario>"
         echo ""
         echo "场景:"
-        echo "  a        - 可观测性缺失测试（随机延迟）"
-        echo "  b        - 资源瓶颈测试（内存泄漏，渐进）"
-        echo "  b-fast   - 快速OOM测试（危险）"
-        echo "  c        - 复合场景测试"
-        echo "  export   - 导出功能测试"
-        echo "  memory   - 查看内存状态"
-        echo "  health   - 检查服务健康"
-        echo "  all      - 运行所有场景"
+        echo "  leak      - 内存泄漏测试（常驻内存，逐渐 OOM）"
+        echo "  gc        - GC 压力测试（临时大对象，响应变慢）"
+        echo "  stress    - 压力测试（快速分配内存）"
+        echo "  combined  - 复合场景（泄漏 + GC 压力）"
+        echo "  oom       - 快速 OOM 测试（危险）"
+        echo ""
+        echo "辅助命令:"
+        echo "  memory    - 查看内存状态"
+        echo "  health    - 检查服务健康"
+        echo "  reset     - 清理缓存，重置测试环境"
         echo ""
         echo "示例:"
-        echo "  $0 http://xxx.elb.amazonaws.com:8080 a"
-        echo "  $0 http://xxx.elb.amazonaws.com:8080 b"
+        echo "  $0 http://xxx.elb.amazonaws.com:8080 leak"
+        echo "  $0 http://xxx.elb.amazonaws.com:8080 gc"
+        echo "  $0 http://xxx.elb.amazonaws.com:8080 memory"
         ;;
 esac

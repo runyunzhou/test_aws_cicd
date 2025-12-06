@@ -5,37 +5,52 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.*;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * 搜索控制器 - 场景A测试
- * 隐藏问题：随机延迟 + 缺乏日志/指标
+ * 搜索控制器
+ * 
+ * 正常业务逻辑，没有刻意注入问题
+ * 但当系统 GC 压力大时，响应时间会自然上升
  */
 @RestController
 @RequestMapping("/api/search")
 public class SearchController {
 
-    private final AtomicInteger requestCount = new AtomicInteger(0);
-    private final Random random = new Random();
-    
     // 模拟搜索数据
-    private static final List<String> MOCK_RESULTS = Arrays.asList(
-            "完成 CI/CD 配置",
-            "学习 AWS CloudFormation",
-            "编写单元测试",
-            "优化数据库查询",
-            "部署生产环境",
-            "代码审查",
-            "性能优化",
-            "安全加固"
-    );
+    private static final List<Map<String, Object>> MOCK_DATA = new ArrayList<>();
+    
+    static {
+        // 初始化模拟数据
+        String[] titles = {
+                "完成 CI/CD 配置",
+                "学习 AWS CloudFormation",
+                "编写单元测试",
+                "优化数据库查询",
+                "部署生产环境",
+                "代码审查",
+                "性能优化",
+                "安全加固",
+                "监控告警配置",
+                "日志采集设置"
+        };
+        
+        String[] categories = {"开发", "运维", "测试", "安全"};
+        String[] priorities = {"HIGH", "MEDIUM", "LOW"};
+        
+        Random random = new Random(42);
+        for (int i = 0; i < titles.length; i++) {
+            Map<String, Object> item = new HashMap<>();
+            item.put("id", i + 1);
+            item.put("title", titles[i]);
+            item.put("category", categories[random.nextInt(categories.length)]);
+            item.put("priority", priorities[random.nextInt(priorities.length)]);
+            item.put("score", random.nextDouble());
+            MOCK_DATA.add(item);
+        }
+    }
 
     /**
      * 搜索功能
-     * 隐藏问题：
-     * 1. 随机产生慢响应（无规律，难以复现）
-     * 2. 没有记录响应时间指标
-     * 3. 没有日志记录慢查询
      */
     @GetMapping
     public ResponseEntity<ApiResponse<Map<String, Object>>> search(
@@ -43,51 +58,31 @@ public class SearchController {
             @RequestParam(defaultValue = "1") int page,
             @RequestParam(defaultValue = "10") int size) {
         
-        int count = requestCount.incrementAndGet();
         long startTime = System.currentTimeMillis();
         
-        // 随机延迟逻辑（没有日志记录）
-        int delayMs = 0;
-        if (count % 7 == 0) {
-            // 每 7 次请求有一次 3-8 秒的延迟
-            delayMs = 3000 + random.nextInt(5000);
-        } else if (count % 13 == 0) {
-            // 每 13 次请求有一次 10-20 秒的延迟
-            delayMs = 10000 + random.nextInt(10000);
-        } else if (random.nextInt(100) < 5) {
-            // 5% 概率随机延迟 2-5 秒
-            delayMs = 2000 + random.nextInt(3000);
-        }
-        
-        if (delayMs > 0) {
-            try {
-                // 故意不记录这个延迟
-                Thread.sleep(delayMs);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-        
-        // 模拟搜索结果
+        // 执行搜索
         List<Map<String, Object>> results = new ArrayList<>();
-        for (String item : MOCK_RESULTS) {
-            if (item.toLowerCase().contains(query.toLowerCase())) {
-                Map<String, Object> result = new HashMap<>();
-                result.put("title", item);
-                result.put("score", random.nextDouble());
-                results.add(result);
+        String queryLower = query.toLowerCase();
+        
+        for (Map<String, Object> item : MOCK_DATA) {
+            String title = ((String) item.get("title")).toLowerCase();
+            if (title.contains(queryLower)) {
+                results.add(item);
             }
         }
         
-        // 如果没有匹配，返回随机结果
+        // 如果没有匹配结果，返回所有数据
         if (results.isEmpty()) {
-            for (int i = 0; i < Math.min(size, MOCK_RESULTS.size()); i++) {
-                Map<String, Object> result = new HashMap<>();
-                result.put("title", MOCK_RESULTS.get(i));
-                result.put("score", random.nextDouble());
-                results.add(result);
-            }
+            results.addAll(MOCK_DATA);
         }
+        
+        // 分页
+        int start = (page - 1) * size;
+        int end = Math.min(start + size, results.size());
+        List<Map<String, Object>> pagedResults = results.subList(
+                Math.min(start, results.size()), 
+                end
+        );
         
         long elapsed = System.currentTimeMillis() - startTime;
         
@@ -96,36 +91,41 @@ public class SearchController {
         response.put("page", page);
         response.put("size", size);
         response.put("total", results.size());
-        response.put("results", results);
-        response.put("took", elapsed + "ms");
+        response.put("results", pagedResults);
+        response.put("tookMs", elapsed);
         
         return ResponseEntity.ok(ApiResponse.success(response));
     }
 
     /**
      * 搜索建议
-     * 隐藏问题：偶发超时
      */
     @GetMapping("/suggest")
     public ResponseEntity<ApiResponse<List<String>>> suggest(
             @RequestParam String prefix) {
         
-        // 10% 概率超时
-        if (random.nextInt(100) < 10) {
-            try {
-                Thread.sleep(5000 + random.nextInt(5000));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-        
         List<String> suggestions = new ArrayList<>();
-        for (String item : MOCK_RESULTS) {
-            if (item.toLowerCase().startsWith(prefix.toLowerCase())) {
-                suggestions.add(item);
+        String prefixLower = prefix.toLowerCase();
+        
+        for (Map<String, Object> item : MOCK_DATA) {
+            String title = (String) item.get("title");
+            if (title.toLowerCase().contains(prefixLower)) {
+                suggestions.add(title);
             }
         }
         
         return ResponseEntity.ok(ApiResponse.success(suggestions));
+    }
+
+    /**
+     * 获取搜索统计
+     */
+    @GetMapping("/stats")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getStats() {
+        Map<String, Object> stats = new HashMap<>();
+        stats.put("totalDocuments", MOCK_DATA.size());
+        stats.put("categories", Arrays.asList("开发", "运维", "测试", "安全"));
+        
+        return ResponseEntity.ok(ApiResponse.success(stats));
     }
 }
