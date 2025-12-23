@@ -86,96 +86,167 @@ scenario_leak() {
 # ========== 场景2: GC 压力（临时大对象）==========
 scenario_gc() {
     log "========== 场景2: GC 压力测试（临时大对象）=========="
-    info "原理: 频繁分配大对象，触发频繁 GC"
+    info "原理: 并发分配大对象，触发频繁 GC"
     info "预期: GC 频繁 → 响应时间上升 → 极端情况 OOM"
     echo ""
     
     check_memory
     
-    log "测试导出功能（观察响应时间变化）..."
-    for i in {1..20}; do
-        log "导出请求 $i/20..."
+    CONCURRENCY=10  # 并发数
+    ROUNDS=5        # 轮数
+    
+    log "并发测试导出功能（并发数: $CONCURRENCY，轮数: $ROUNDS）..."
+    
+    # 创建临时文件记录结果
+    RESULT_FILE="/tmp/gc_test_results_$$.txt"
+    > "$RESULT_FILE"
+    
+    for round in $(seq 1 $ROUNDS); do
+        log "第 $round/$ROUNDS 轮（每轮 $CONCURRENCY 个并发请求，每个 50MB）..."
         
-        start_time=$(date +%s%3N)
-        response=$(curl -s "$APP_URL/api/export/reports?dateRange=last_quarter" 2>/dev/null)
-        end_time=$(date +%s%3N)
-        elapsed=$((end_time - start_time))
+        # 并发发起请求，记录状态码和耗时
+        for i in $(seq 1 $CONCURRENCY); do
+            curl -s -o /dev/null -w "%{http_code} %{time_total}\n" \
+                "$APP_URL/api/export/reports?dateRange=last_year" 2>/dev/null >> "$RESULT_FILE" &
+        done
         
-        if [ -z "$response" ]; then
-            error "请求失败"
-        else
-            echo "  耗时: ${elapsed}ms"
+        # 等待所有并发请求完成
+        wait
+        
+        # 统计本轮结果
+        total=$(wc -l < "$RESULT_FILE" | tr -d ' ')
+        success=$(grep "^200 " "$RESULT_FILE" | wc -l | tr -d ' ')
+        errors=$(grep -v "^200 " "$RESULT_FILE" | wc -l | tr -d ' ')
+        avg_time=$(awk '{sum+=$2} END {if(NR>0) printf "%.3f", sum/NR; else print "0"}' "$RESULT_FILE")
+        max_time=$(awk 'BEGIN{max=0} {if($2>max)max=$2} END{printf "%.3f", max}' "$RESULT_FILE")
+        
+        echo "  统计: 成功=$success, 失败=$errors, 平均耗时=${avg_time}s, 最大耗时=${max_time}s"
+        
+        # 显示错误详情
+        if [ "$errors" -gt 0 ]; then
+            error "错误响应:"
+            grep -v "^200 " "$RESULT_FILE" | head -5
         fi
         
-        sleep 0.2
+        > "$RESULT_FILE"  # 清空准备下一轮
+        
+        echo ""
+        check_memory
+        sleep 1
     done
     
+    rm -f "$RESULT_FILE"
     log "场景2测试完成"
-    check_memory
 }
 
 # ========== 场景3: 压力测试 ==========
 scenario_stress() {
-    log "========== 场景3: 压力测试 =========="
-    info "原理: 快速分配大量临时内存，测试 GC 极限"
+    log "========== 场景3: 高并发压力测试 =========="
+    info "原理: 高并发分配大量临时内存，测试 GC 极限"
     echo ""
     
     check_memory
     
-    log "执行压力测试..."
-    for i in {1..10}; do
-        log "压力测试 $i/10 (每次 20MB x 5 次迭代)..."
+    CONCURRENCY=30  # 并发数
+    ROUNDS=3        # 轮数
+    
+    log "执行高并发压力测试（并发数: $CONCURRENCY，轮数: $ROUNDS）..."
+    
+    RESULT_FILE="/tmp/stress_test_results_$$.txt"
+    > "$RESULT_FILE"
+    
+    for round in $(seq 1 $ROUNDS); do
+        log "第 $round/$ROUNDS 轮（每轮 $CONCURRENCY 个并发请求，每个 90MB）..."
         
-        start_time=$(date +%s%3N)
-        response=$(curl -s "$APP_URL/api/export/stress?sizeMB=20&iterations=5" 2>/dev/null)
-        end_time=$(date +%s%3N)
-        elapsed=$((end_time - start_time))
+        # 并发发起 stress 请求
+        for i in $(seq 1 $CONCURRENCY); do
+            curl -s -o /dev/null -w "%{http_code} %{time_total}\n" \
+                "$APP_URL/api/export/stress?sizeMB=30&iterations=3" 2>/dev/null >> "$RESULT_FILE" &
+        done
         
-        if [ -n "$response" ]; then
-            echo "  耗时: ${elapsed}ms, 响应: $(echo $response | head -c 100)..."
-        else
-            error "请求失败，服务可能已崩溃"
-            break
+        wait
+        
+        # 统计本轮结果
+        total=$(wc -l < "$RESULT_FILE" | tr -d ' ')
+        success=$(grep "^200 " "$RESULT_FILE" | wc -l | tr -d ' ')
+        errors=$(grep -v "^200 " "$RESULT_FILE" | wc -l | tr -d ' ')
+        avg_time=$(awk '{sum+=$2} END {if(NR>0) printf "%.3f", sum/NR; else print "0"}' "$RESULT_FILE")
+        max_time=$(awk 'BEGIN{max=0} {if($2>max)max=$2} END{printf "%.3f", max}' "$RESULT_FILE")
+        
+        echo "  统计: 成功=$success, 失败=$errors, 平均耗时=${avg_time}s, 最大耗时=${max_time}s"
+        
+        # 显示错误详情
+        if [ "$errors" -gt 0 ]; then
+            error "错误响应码:"
+            grep -v "^200 " "$RESULT_FILE" | awk '{print $1}' | sort | uniq -c
         fi
         
-        sleep 0.5
+        > "$RESULT_FILE"
+        
+        echo ""
+        check_memory
+        sleep 1
     done
     
+    rm -f "$RESULT_FILE"
     log "场景3测试完成"
-    check_memory
 }
 
 # ========== 场景4: 复合场景（泄漏 + GC 压力）==========
 scenario_combined() {
     log "========== 场景4: 复合场景测试 =========="
-    info "原理: 同时触发内存泄漏和 GC 压力"
-    info "预期: 内存增长 + 响应变慢"
+    info "原理: 同时触发内存泄漏和高并发 GC 压力"
+    info "预期: 内存持续增长 + 响应变慢 + 最终 OOM"
     echo ""
     
     check_memory
     
-    for i in {1..15}; do
-        log "复合请求 $i/15..."
+    ROUNDS=10
+    CONCURRENCY=5
+    
+    RESULT_FILE="/tmp/combined_test_results_$$.txt"
+    
+    for round in $(seq 1 $ROUNDS); do
+        log "第 $round/$ROUNDS 轮..."
+        > "$RESULT_FILE"
         
-        # 并发发起多种请求
-        curl -s -X POST "$APP_URL/api/reports/generate" \
-            -H "Content-Type: application/json" \
-            -d '{"type": "detailed"}' > /dev/null 2>&1 &
+        # 内存泄漏请求（常驻内存）
+        for i in $(seq 1 3); do
+            curl -s -o /dev/null -w "leak:%{http_code} %{time_total}\n" \
+                -X POST "$APP_URL/api/reports/generate" \
+                -H "Content-Type: application/json" \
+                -d '{"type": "detailed"}' 2>/dev/null >> "$RESULT_FILE" &
+        done
         
-        curl -s "$APP_URL/api/export/reports?dateRange=last_quarter" > /dev/null 2>&1 &
-        
-        curl -s "$APP_URL/api/search?query=test" > /dev/null 2>&1 &
+        # GC 压力请求（临时大对象）
+        for i in $(seq 1 $CONCURRENCY); do
+            curl -s -o /dev/null -w "gc:%{http_code} %{time_total}\n" \
+                "$APP_URL/api/export/reports?dateRange=last_year" 2>/dev/null >> "$RESULT_FILE" &
+        done
         
         wait
         
-        if [ $((i % 5)) -eq 0 ]; then
-            check_memory
+        # 统计结果
+        leak_success=$(grep "^leak:200 " "$RESULT_FILE" | wc -l | tr -d ' ')
+        leak_errors=$(grep "^leak:" "$RESULT_FILE" | grep -v "^leak:200 " | wc -l | tr -d ' ')
+        gc_success=$(grep "^gc:200 " "$RESULT_FILE" | wc -l | tr -d ' ')
+        gc_errors=$(grep "^gc:" "$RESULT_FILE" | grep -v "^gc:200 " | wc -l | tr -d ' ')
+        
+        echo "  泄漏请求: 成功=$leak_success, 失败=$leak_errors"
+        echo "  GC请求: 成功=$gc_success, 失败=$gc_errors"
+        
+        # 显示错误
+        total_errors=$((leak_errors + gc_errors))
+        if [ "$total_errors" -gt 0 ]; then
+            error "有 $total_errors 个错误请求"
         fi
+        
+        check_memory
         sleep 1
     done
     
+    rm -f "$RESULT_FILE"
     log "场景4测试完成"
-    check_memory
 }
 
 # ========== 快速 OOM ==========
