@@ -242,7 +242,7 @@ Resources:
               -
                 Effect: "Allow"
                 Action: 
-                - "s3:getObject"
+                - "s3:GetObject"
                 Resource: !Sub arn:${AWS::Partition}:s3:::${WebappDeploymentBucket}/*
   IDCProvider:
       Type: AWS::IAM::OIDCProvider
